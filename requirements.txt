@@ -1,1 +1,8 @@
-websocket-client==1.7.0
+streamlit
+websocket-client
+pandas
+duckdb
+requests
+pytz
+google-auth
+google-api-python-client
