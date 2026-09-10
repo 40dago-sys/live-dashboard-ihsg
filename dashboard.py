@@ -215,7 +215,6 @@ with t4:
             df_ex = db.execute(f"SELECT ticker, SUM(value) as Net_Value FROM trades WHERE timestamp >= NOW() - INTERVAL {radar_time} MINUTE GROUP BY ticker ORDER BY Net_Value DESC LIMIT 10").df()
             df_ex.insert(0, 'waktu', datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S'))
             sukses, msg = kirim_ke_gsheets("Top_Summary", df_ex)
-            # Menampilkan TEKS ASLI dari mesin Google
             if sukses: st.info(f"Respons Google: {msg}")
             else: st.error(msg)
     with colB:
@@ -237,6 +236,28 @@ with t4:
     with st.expander("📡 Status Koneksi WSS (Klik untuk buka log)"):
         df_logs = db.execute("SELECT * FROM sys_logs ORDER BY waktu DESC LIMIT 15").df()
         st.dataframe(df_logs, use_container_width=True)
+
+    # ==========================================
+    # TOMBOL SUNTIKAN DUMMY (UAT) ADA DI SINI
+    # ==========================================
+    st.markdown("---")
+    st.subheader("🧪 UAT Mode (Market Closed Simulator)")
+    if st.button("Suntik 100 Data Dummy (Untuk Test Export)"):
+        import random
+        ts = datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S')
+        saham_list = ["BBCA", "BREN", "BMRI", "AMMN", "ASII", "CUAN", "TPIA"]
+        
+        for _ in range(100):
+            ticker = random.choice(saham_list)
+            price = random.randint(1000, 9000)
+            lot = random.randint(10, 15000) 
+            val = price * lot * 100
+            tipe = random.choice(["BUY", "SELL"])
+            
+            db.execute("INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?)", 
+                       (ts, ticker, price, lot, val, tipe))
+            
+        st.success("✅ 100 Baris Data Dummy berhasil disuntikkan! Silakan cek Tab 1-3 dan klik tombol Export.")
 
 if not pause_scroll:
     time.sleep(3)
