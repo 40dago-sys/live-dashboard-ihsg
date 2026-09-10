@@ -66,7 +66,7 @@ def start_wss_thread():
         pass
 
     def run_ws():
-        ws_url = "wss://stream.arjum.com/..." # Ganti dengan URL WSS Arjum Bapak
+        ws_url = "wss://stock.arjum.com/ws/running-trade" # Ganti dengan URL WSS Arjum Bapak
         ws = websocket.WebSocketApp(ws_url, on_message=on_message, on_error=on_error)
         while True:
             ws.run_forever()
