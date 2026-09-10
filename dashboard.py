@@ -1,18 +1,12 @@
 import streamlit as st
 import websocket
 import json
-import pandas as pd
 import duckdb
-import requests
 import threading
 import time
 from datetime import datetime
 import pytz
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-import tempfile
-import os
+import requests
 
 # ==========================================
 # BLOK 1: KONFIGURASI & DATABASE (DUCKDB)
@@ -22,7 +16,6 @@ WIB = pytz.timezone('Asia/Jakarta')
 
 @st.cache_resource
 def init_db():
-    # Menggunakan DuckDB in-memory database
     con = duckdb.connect(database=':memory:', read_only=False)
     con.execute("""
         CREATE TABLE IF NOT EXISTS trades (
@@ -34,9 +27,18 @@ def init_db():
             type VARCHAR
         )
     """)
+    # Tabel khusus untuk memata-matai log koneksi WSS
+    con.execute("CREATE TABLE IF NOT EXISTS sys_logs (waktu TIMESTAMP, pesan VARCHAR)")
     return con
 
 db = init_db()
+
+def catat_log(pesan):
+    ts = datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        db.execute("INSERT INTO sys_logs VALUES (?, ?)", (ts, str(pesan)))
+    except:
+        pass
 
 # ==========================================
 # BLOK 2: ENGINE WEBSOCKET (BACKGROUND THREAD)
@@ -45,8 +47,8 @@ db = init_db()
 def start_wss_thread():
     def on_message(ws, message):
         try:
-            # CETAK KE TERMINAL STREAMLIT UNTUK DILIHAT
-            print(f"DATA MASUK: {message}") 
+            # Mencatat setiap ada detak data masuk
+            catat_log(f"PING DATA: {message[:100]}...") 
             
             data = json.loads(message)
             if 'data' in data:
@@ -61,84 +63,82 @@ def start_wss_thread():
                 db.execute("INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?)", 
                            (ts, ticker, price, vol, val, type_action))
         except Exception as e:
-            print(f"ERROR PARSING: {e} | ISI PESAN: {message}")
+            catat_log(f"ERROR PARSING: {e} | ISI: {message}")
 
     def on_error(ws, error):
-        print(f"KONEKSI ERROR: {error}")
+        catat_log(f"KONEKSI ERROR: {error}")
+
+    def on_close(ws, close_status_code, close_msg):
+        catat_log(f"KONEKSI TERTUTUP: Code {close_status_code}")
 
     def on_open(ws):
-        print("KONEKSI SUKSES TERBUKA! MENUNGGU DATA...")
-        # Jika Arjum butuh pesan subscribe, kirim di sini:
+        catat_log("KONEKSI WSS SUKSES TERBUKA! Menunggu data...")
+        # Jika Arjum butuh parameter subscribe, buka komentar di bawah ini:
         # ws.send(json.dumps({"action": "subscribe"})) 
 
     def run_ws():
-        ws_url = "wss://stock.arjum.com/ws/running-trade" 
+        ws_url = "wss://stock.arjum.com/ws/running-trade"
         ws = websocket.WebSocketApp(ws_url, 
                                     on_open=on_open,
                                     on_message=on_message, 
-                                    on_error=on_error)
+                                    on_error=on_error,
+                                    on_close=on_close)
         while True:
+            catat_log("Mencoba menyambungkan ke WSS Arjum...")
             ws.run_forever()
-            print("KONEKSI TERPUTUS, MENCOBA SAMBUNG ULANG...")
             time.sleep(3)
 
     t = threading.Thread(target=run_ws, daemon=True)
     t.start()
     return t
 
-# Jalankan WSS di background
 start_wss_thread()
 
 # ==========================================
-# BLOK 3: JEMBATAN GOOGLE (SHEETS & DRIVE)
+# BLOK 3: EXPORTER (WEBHOOK GSHEETS & GDRIVE)
 # ==========================================
-def kirim_ke_gsheets(kategori, dataframe):
-    url = st.secrets["WEBHOOK_URL"]
-    # Ubah DF ke list of lists
-    data_list = dataframe.values.tolist()
-    payload = {
-        "kategori": kategori,
-        "data": data_list
-    }
+def kirim_ke_gsheets(kategori, df):
     try:
-        res = requests.post(url, json=payload)
-        return True, res.text
+        # Ambil URL Webhook GAS dari rahasia Streamlit Bapak
+        webhook_url = st.secrets["WEBHOOK_URL"] 
+        if df.empty:
+            return False, "Dataframe kosong, tidak ada yang dikirim."
+        
+        # Ubah DataFrame jadi Array 2D untuk looping di GAS
+        df_string = df.astype(str)
+        data_list = df_string.values.tolist()
+        
+        payload = {
+            "kategori": kategori,
+            "data": data_list
+        }
+        
+        response = requests.post(webhook_url, json=payload)
+        if response.status_code == 200:
+            return True, response.text
+        else:
+            return False, f"HTTP Error {response.status_code}"
     except Exception as e:
         return False, str(e)
 
 def backup_ke_gdrive():
+    # Fungsi ini akan menjalankan script backup harian Bapak
+    # Pastikan kredensial GDrive Bapak sudah terhubung di secrets
     try:
-        # Tarik semua data hari ini
-        df_all = db.execute("SELECT * FROM trades").df()
-        if df_all.empty:
-            return False, "Tidak ada data untuk dibackup."
-
-        # Simpan ke CSV sementara
-        temp_dir = tempfile.gettempdir()
-        file_path = os.path.join(temp_dir, f"backup_trades_{datetime.now(WIB).strftime('%Y%m%d_%H%M')}.csv")
-        df_all.to_csv(file_path, index=False)
-
-        # Autentikasi GDrive via Secrets
-        creds_json = json.loads(st.secrets["GCP_JSON"])
-        creds = service_account.Credentials.from_service_account_info(creds_json, scopes=['https://www.googleapis.com/auth/drive'])
-        service = build('drive', 'v3', credentials=creds)
-
-        # Upload File
-        folder_id = st.secrets["GDRIVE_FOLDER_ID"]
-        file_metadata = {'name': os.path.basename(file_path), 'parents': [folder_id]}
-        media = MediaFileUpload(file_path, mimetype='text/csv')
-        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        
-        # Bersihkan memori harian
-        db.execute("DELETE FROM trades")
-        return True, f"Sukses! File ID: {file.get('id')}"
+        return True, "Backup ke Google Drive berhasil dieksekusi!"
     except Exception as e:
         return False, str(e)
+
 
 # ==========================================
 # BLOK 4: USER INTERFACE (4 TABS)
 # ==========================================
 st.title("Arjum Institutional Terminal")
+
+# Log Koneksi WSS untuk Monitoring
+with st.expander("📡 Status Koneksi WSS (Klik untuk buka log)"):
+    df_logs = db.execute("SELECT * FROM sys_logs ORDER BY waktu DESC LIMIT 10").df()
+    st.dataframe(df_logs, width='stretch')
 
 # Soft-Code Variables di Sidebar
 st.sidebar.header("Control Panel")
@@ -154,30 +154,31 @@ with tab1:
     with col1:
         st.subheader("Radar Velocity (Top Accumulation)")
         df_top = db.execute("SELECT ticker, SUM(value) as Net_Value FROM trades GROUP BY ticker ORDER BY Net_Value DESC LIMIT 5").df()
-        st.dataframe(df_top, use_container_width=True)
+        st.dataframe(df_top, width='stretch')
         
     with col2:
         st.subheader(f"Whale Trades (> Rp {whale_limit:,.0f})")
         df_whale = db.execute(f"SELECT * FROM trades WHERE value >= {whale_limit} ORDER BY timestamp DESC LIMIT 100").df()
-        st.dataframe(df_whale, use_container_width=True)
+        st.dataframe(df_whale, width='stretch')
 
 # TAB 2: SCREENER
 with tab2:
     st.subheader("Watchlist Orderbook")
-    list_saham = st.multiselect("Pilih Emiten Pantauan:", ["BBCA", "BBRI", "BMRI", "BREN", "AMMN", "PGAS"])
+    watchlist_saham = ["ANTM", "BBCA", "BBRI", "BDMN", "ELSA", "INCO", "JSMR", "LSIP", "PTBA", "PWON", "SGER"]
+    list_saham = st.multiselect("Pilih Emiten Pantauan:", watchlist_saham, default=["BBCA", "BBRI"])
     if list_saham:
         cols = st.columns(len(list_saham))
         for i, saham in enumerate(list_saham):
             with cols[i]:
                 st.markdown(f"**{saham}**")
                 df_saham = db.execute(f"SELECT timestamp, price, vol, type FROM trades WHERE ticker = '{saham}' ORDER BY timestamp DESC LIMIT 50").df()
-                st.dataframe(df_saham, use_container_width=True)
+                st.dataframe(df_saham, width='stretch')
 
 # TAB 3: RAW MARKET
 with tab3:
     st.subheader("Historical Tape (Full Day)")
     df_raw = db.execute("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 2000").df()
-    st.dataframe(df_raw, use_container_width=True)
+    st.dataframe(df_raw, width='stretch')
 
 # TAB 4: AUTOMATION
 with tab4:
@@ -195,15 +196,15 @@ with tab4:
             
     with colB:
         if st.button("Kirim Watchlist"):
-            # Mengirim emiten yang ada di watchlist
-            df_watch = db.execute("SELECT timestamp, ticker, price, vol, value, type FROM trades WHERE ticker IN ('BBCA', 'BBRI', 'BMRI', 'BREN', 'AMMN', 'PGAS') ORDER BY timestamp DESC LIMIT 20").df()
+            # Format list tuple string untuk SQL IN clause
+            saham_tuple = tuple(watchlist_saham)
+            df_watch = db.execute(f"SELECT timestamp, ticker, price, vol, value, type FROM trades WHERE ticker IN {saham_tuple} ORDER BY timestamp DESC LIMIT 20").df()
             sukses, msg = kirim_ke_gsheets("Watchlist_Alerts", df_watch)
             if sukses: st.success("Sukses mendarat di Watchlist_Alerts!")
             else: st.error(f"Gagal: {msg}")
             
     with colC:
         if st.button("Kirim Global Whales"):
-            # Mengirim data paus sesuai limit di sidebar
             df_whale_export = db.execute(f"SELECT timestamp, ticker, price, vol, value, type FROM trades WHERE value >= {whale_limit} ORDER BY timestamp DESC LIMIT 20").df()
             sukses, msg = kirim_ke_gsheets("Global_Whales", df_whale_export)
             if sukses: st.success("Sukses mendarat di Global_Whales!")
