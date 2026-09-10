@@ -147,8 +147,7 @@ with tab1:
     col1, col2 = st.columns([1, 2])
     with col1:
         st.subheader("Radar Velocity (Top Accumulation)")
-        # Hitung Net Buy (Bisa disesuaikan dengan logika exact arjum: Buy - Sell)
-        df_top = db.execute(f"SELECT ticker, SUM(value) as Net_Value FROM trades GROUP BY ticker ORDER BY Net_Value DESC LIMIT 5").df()
+        df_top = db.execute("SELECT ticker, SUM(value) as Net_Value FROM trades GROUP BY ticker ORDER BY Net_Value DESC LIMIT 5").df()
         st.dataframe(df_top, use_container_width=True)
         
     with col2:
@@ -178,21 +177,35 @@ with tab3:
 with tab4:
     st.subheader("Data Center & Exporter")
     
-    if st.button("Kirim Top 5 ke GSheets"):
-        df_top_export = db.execute("SELECT ticker, SUM(value) FROM trades GROUP BY ticker ORDER BY SUM(value) DESC LIMIT 5").df()
-        # Tambahkan kolom waktu agar di excel ketahuan jam berapa
-        df_top_export.insert(0, 'waktu', datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S'))
-        sukses, msg = kirim_ke_gsheets("Top_Summary", df_top_export)
-        if sukses:
-            st.success("Terkirim ke Tab Top_Summary di GSheets!")
-        else:
-            st.error(f"Gagal: {msg}")
+    colA, colB, colC = st.columns(3)
+    
+    with colA:
+        if st.button("Kirim Top 5"):
+            df_top_export = db.execute("SELECT ticker, SUM(value) as Net_Value FROM trades GROUP BY ticker ORDER BY Net_Value DESC LIMIT 5").df()
+            df_top_export.insert(0, 'waktu', datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S'))
+            sukses, msg = kirim_ke_gsheets("Top_Summary", df_top_export)
+            if sukses: st.success("Sukses mendarat di Top_Summary!")
+            else: st.error(f"Gagal: {msg}")
+            
+    with colB:
+        if st.button("Kirim Watchlist"):
+            # Mengirim emiten yang ada di watchlist
+            df_watch = db.execute("SELECT timestamp, ticker, price, vol, value, type FROM trades WHERE ticker IN ('BBCA', 'BBRI', 'BMRI', 'BREN', 'AMMN', 'PGAS') ORDER BY timestamp DESC LIMIT 20").df()
+            sukses, msg = kirim_ke_gsheets("Watchlist_Alerts", df_watch)
+            if sukses: st.success("Sukses mendarat di Watchlist_Alerts!")
+            else: st.error(f"Gagal: {msg}")
+            
+    with colC:
+        if st.button("Kirim Global Whales"):
+            # Mengirim data paus sesuai limit di sidebar
+            df_whale_export = db.execute(f"SELECT timestamp, ticker, price, vol, value, type FROM trades WHERE value >= {whale_limit} ORDER BY timestamp DESC LIMIT 20").df()
+            sukses, msg = kirim_ke_gsheets("Global_Whales", df_whale_export)
+            if sukses: st.success("Sukses mendarat di Global_Whales!")
+            else: st.error(f"Gagal: {msg}")
 
     st.markdown("---")
-    st.warning("Tekan ini hanya saat bursa tutup (16:30) untuk memindahkan arsip harian dan mengosongkan RAM.")
+    st.warning("Tekan ini hanya saat bursa tutup (16:30) untuk memindahkan arsip harian ke GDrive dan mengosongkan RAM.")
     if st.button("End of Day: Backup to GDrive & Purge RAM"):
         sukses, msg = backup_ke_gdrive()
-        if sukses:
-            st.success(msg)
-        else:
-            st.error(f"Gagal: {msg}")
+        if sukses: st.success(msg)
+        else: st.error(f"Gagal: {msg}")
