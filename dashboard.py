@@ -47,18 +47,25 @@ def catat_log(pesan):
 def start_wss_thread():
     def on_message(ws, message):
         try:
-            # Mencatat setiap ada detak data masuk
-            catat_log(f"PING DATA: {message[:100]}...") 
+            # Mencatat sedikit sampel data ke log radar kita
+            catat_log(f"PING DATA: {message[:80]}...") 
             
-            data = json.loads(message)
-            if 'data' in data:
-                trade = data['data']
+            msg = json.loads(message)
+            
+            # Kita abaikan pesan snapshot/top5, murni memburu transaksi ("trade")
+            if msg.get("type") == "trade":
+                trade = msg.get("data", {})
                 ts = datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S')
-                ticker = trade.get('code', '')
-                price = float(trade.get('price', 0))
-                vol = int(trade.get('volume', 0))
-                val = float(trade.get('value', 0))
-                type_action = trade.get('type', 'UNKNOWN')
+                
+                ticker = trade.get('t', '')
+                price = float(trade.get('p', 0))
+                lot = int(trade.get('l', 0))
+                
+                # Kalkulasi dari lot ke satuan lembar saham & Rupiah
+                vol = lot * 100
+                val = price * vol
+                
+                type_action = trade.get('c', 'UNKNOWN') # c: buy/sell
                 
                 db.execute("INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?)", 
                            (ts, ticker, price, vol, val, type_action))
@@ -72,13 +79,24 @@ def start_wss_thread():
         catat_log(f"KONEKSI TERTUTUP: Code {close_status_code}")
 
     def on_open(ws):
-        catat_log("KONEKSI WSS SUKSES TERBUKA! Menunggu data...")
-        # Jika Arjum butuh parameter subscribe, buka komentar di bawah ini:
-        # ws.send(json.dumps({"action": "subscribe"})) 
+        catat_log("KONEKSI WSS SUKSES TERBUKA! Menembus Autentikasi...")
 
     def run_ws():
         ws_url = "wss://stock.arjum.com/ws/running-trade"
+        
+        # Mengambil API Key dari brankas rahasia Streamlit Bapak
+        # Tolong tambahkan ARJUM_API_KEY = "sk_live_WI0TxP..." di Streamlit Secrets
+        try:
+            api_key = st.secrets["ARJUM_API_KEY"]
+        except:
+            # Fallback darurat jika Bapak belum menyimpannya di secrets
+            api_key = "sk_live_WI0TxP..." 
+            
+        # Membungkus API Key ke dalam Header
+        headers = [f"X-API-Key: {api_key}"]
+
         ws = websocket.WebSocketApp(ws_url, 
+                                    header=headers,
                                     on_open=on_open,
                                     on_message=on_message, 
                                     on_error=on_error,
