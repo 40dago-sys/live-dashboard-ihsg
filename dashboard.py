@@ -4,7 +4,7 @@ import json
 import duckdb
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import requests
 
@@ -17,10 +17,11 @@ WIB = pytz.timezone('Asia/Jakarta')
 @st.cache_resource
 def init_db():
     con = duckdb.connect(database=':memory:', read_only=False)
+    # Kolom sekarang menggunakan LOT
     con.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             timestamp TIMESTAMP, ticker VARCHAR, price DOUBLE, 
-            vol BIGINT, value DOUBLE, type VARCHAR
+            lot BIGINT, value DOUBLE, type VARCHAR
         )
     """)
     con.execute("CREATE TABLE IF NOT EXISTS sys_logs (waktu TIMESTAMP, pesan VARCHAR)")
@@ -30,7 +31,6 @@ db = init_db()
 
 @st.cache_resource
 def get_sys_config():
-    # Menyimpan status background worker antar-thread
     return {"auto_export": False, "interval": 30, "last_export": int(time.time())}
 
 sys_cfg = get_sys_config()
@@ -45,7 +45,6 @@ def catat_log(pesan):
 # ==========================================
 @st.cache_resource
 def start_engines():
-    # 2A. WSS ENGINE
     def on_message(ws, message):
         try:
             msg = json.loads(message)
@@ -54,15 +53,15 @@ def start_engines():
                 ts = datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S')
                 ticker = trade.get('t', '')
                 price = float(trade.get('p', 0))
-                lot = int(trade.get('l', 0))
+                lot = int(trade.get('l', 0)) # Disimpan sebagai Lot
                 
-                vol = lot * 100
-                val = price * vol
+                # Value dihitung otomatis secara rahasia (Lot * 100 * Harga)
+                val = price * lot * 100
                 type_action = str(trade.get('c', '')).upper()
                 
-                db.execute("INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?)", (ts, ticker, price, vol, val, type_action))
+                db.execute("INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?)", (ts, ticker, price, lot, val, type_action))
         except Exception as e:
-            pass # Silent fail untuk kecepatan
+            pass 
 
     def on_error(ws, error): catat_log(f"WS ERROR: {error}")
     def on_close(ws, c_code, c_msg): catat_log(f"WS CLOSED: {c_code}")
@@ -79,34 +78,28 @@ def start_engines():
             ws.run_forever()
             time.sleep(3)
 
-    # 2B. CRON JOB WORKER (Auto-Export & Alarm 16:30)
     def run_cron():
         while True:
             time.sleep(1)
             now_wib = datetime.now(WIB)
             
-            # Alarm Purge 16:30 WIB
             if now_wib.hour == 16 and now_wib.minute == 30 and now_wib.second == 0:
                 catat_log("AUTO-PURGE 16:30: Mengosongkan RAM DB...")
                 db.execute("DELETE FROM trades")
-                time.sleep(2) # Mencegah trigger ganda
+                time.sleep(2) 
                 
-            # Auto Export GSheets
             if sys_cfg["auto_export"]:
                 curr_time = int(time.time())
                 if curr_time - sys_cfg["last_export"] >= sys_cfg["interval"]:
-                    # Eksekusi Tembakan
                     try:
                         wh_url = st.secrets.get("WEBHOOK_URL", "")
                         if wh_url:
-                            # Top Summary
                             df_top = db.execute("SELECT ticker, SUM(value) as Net_Value FROM trades GROUP BY ticker ORDER BY Net_Value DESC LIMIT 10").df()
                             if not df_top.empty:
                                 df_top.insert(0, 'waktu', datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S'))
                                 df_top['waktu'] = df_top['waktu'].astype(str)
                                 requests.post(wh_url, json={"kategori": "Top_Summary", "data": df_top.values.tolist()})
                                 
-                            # Global Whales (Hardcode limit 50jt untuk background)
                             df_whale = db.execute("SELECT * FROM trades WHERE value >= 50000000 ORDER BY timestamp DESC LIMIT 30").df()
                             if not df_whale.empty:
                                 df_whale['timestamp'] = df_whale['timestamp'].astype(str)
@@ -133,6 +126,7 @@ def kirim_ke_gsheets(kategori, df):
         if 'waktu' in df.columns: df['waktu'] = df['waktu'].astype(str)
         
         res = requests.post(webhook_url, json={"kategori": kategori, "data": df.values.tolist()})
+        # Kita ambil respons ASLI dari Google agar ketahuan errornya
         return (True, res.text) if res.status_code == 200 else (False, f"HTTP {res.status_code}")
     except Exception as e:
         return False, str(e)
@@ -142,12 +136,11 @@ def kirim_ke_gsheets(kategori, df):
 # ==========================================
 st.title("Arjum Institutional Terminal")
 
-# Format Kolom (Rapih & Delimiter)
 cfg_std = {
     "timestamp": st.column_config.DatetimeColumn("Waktu", format="HH:mm:ss"),
     "ticker": st.column_config.TextColumn("Emiten"),
     "price": st.column_config.NumberColumn("Harga", format="%d"),
-    "vol": st.column_config.NumberColumn("Volume (Lembar)", format="%,d"),
+    "lot": st.column_config.NumberColumn("Volume (Lot)", format="%,d"), # Sudah diubah ke LOT
     "value": st.column_config.NumberColumn("Nilai (Rp)", format="%,d"),
     "type": st.column_config.TextColumn("Action")
 }
@@ -161,21 +154,27 @@ st.sidebar.header("🕹️ Control Panel")
 pause_scroll = st.sidebar.checkbox("⏸️ Pause Live View (Untuk Scrolling)", value=False)
 whale_limit = st.sidebar.number_input("Batas Paus (Rp)", value=50000000, step=10000000)
 
+# Mengembalikan Slider Timeframe
+radar_time = st.sidebar.selectbox("Timeframe Radar (Menit)", [5, 15, 30, 60, 120, 240], index=0)
+
 st.sidebar.markdown("---")
 st.sidebar.subheader("⚙️ Auto-Export GSheets")
 sys_cfg["auto_export"] = st.sidebar.toggle("Aktifkan Auto-Export", value=False)
 sys_cfg["interval"] = st.sidebar.slider("Interval (Detik)", min_value=10, max_value=180, value=30, step=10)
 
-# --- TAB DASHBOARD ---
 t1, t2, t3, t4 = st.tabs(["The Cockpit", "Screener", "Raw Market", "System & Exporter"])
 
 with t1:
     c1, c2 = st.columns([1, 2])
     with c1:
-        st.subheader("Radar Velocity")
+        st.subheader(f"Radar Velocity ({radar_time} Menit Terakhir)")
         f_top = st.radio("Aksi:", ["All", "BUY", "SELL"], horizontal=True, key="rtop")
-        q_top = f"WHERE type = '{f_top}'" if f_top != "All" else ""
-        df_top = db.execute(f"SELECT ticker, SUM(value) as Net_Value FROM trades {q_top} GROUP BY ticker ORDER BY Net_Value DESC LIMIT 15").df()
+        
+        # Logika SQL dengan Filter Timeframe
+        q_type = f"type = '{f_top}' AND" if f_top != "All" else ""
+        q_time = f"timestamp >= NOW() - INTERVAL {radar_time} MINUTE"
+        
+        df_top = db.execute(f"SELECT ticker, SUM(value) as Net_Value FROM trades WHERE {q_type} {q_time} GROUP BY ticker ORDER BY Net_Value DESC LIMIT 15").df()
         st.dataframe(df_top, column_config=cfg_top, hide_index=True, height=500, use_container_width=True)
         
     with c2:
@@ -192,12 +191,13 @@ with t2:
     
     list_emiten = [x.strip().upper() for x in input_em.split(",") if x.strip()]
     if list_emiten:
-        cols = st.columns(len(list_emiten) if len(list_emiten) <= 4 else 4)
+        # Kunci maksimal 3 kolom sejajar
+        cols = st.columns(min(len(list_emiten), 3))
         for i, saham in enumerate(list_emiten):
-            with cols[i % 4]:
+            with cols[i % 3]:
                 st.markdown(f"**{saham}**")
                 q_wl_type = f"AND type = '{f_wl}'" if f_wl != "All" else ""
-                df_saham = db.execute(f"SELECT timestamp, price, vol, value, type FROM trades WHERE ticker = '{saham}' {q_wl_type} ORDER BY timestamp DESC LIMIT 100").df()
+                df_saham = db.execute(f"SELECT timestamp, price, lot, value, type FROM trades WHERE ticker = '{saham}' {q_wl_type} ORDER BY timestamp DESC LIMIT 100").df()
                 st.dataframe(df_saham, column_config=cfg_std, hide_index=True, height=400, use_container_width=True)
 
 with t3:
@@ -212,10 +212,11 @@ with t4:
     colA, colB, colC = st.columns(3)
     with colA:
         if st.button("Manual: Kirim Top Summary"):
-            df_ex = db.execute("SELECT ticker, SUM(value) as Net_Value FROM trades GROUP BY ticker ORDER BY Net_Value DESC LIMIT 10").df()
+            df_ex = db.execute(f"SELECT ticker, SUM(value) as Net_Value FROM trades WHERE timestamp >= NOW() - INTERVAL {radar_time} MINUTE GROUP BY ticker ORDER BY Net_Value DESC LIMIT 10").df()
             df_ex.insert(0, 'waktu', datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S'))
             sukses, msg = kirim_ke_gsheets("Top_Summary", df_ex)
-            if sukses: st.success("Terkirim!")
+            # Menampilkan TEKS ASLI dari mesin Google
+            if sukses: st.info(f"Respons Google: {msg}")
             else: st.error(msg)
     with colB:
         if st.button("Manual: Kirim Watchlist"):
@@ -223,13 +224,13 @@ with t4:
                 tup_saham = tuple(list_emiten) if len(list_emiten) > 1 else f"('{list_emiten[0]}')"
                 df_ex = db.execute(f"SELECT * FROM trades WHERE ticker IN {tup_saham} ORDER BY timestamp DESC LIMIT 50").df()
                 sukses, msg = kirim_ke_gsheets("Watchlist_Alerts", df_ex)
-                if sukses: st.success("Terkirim!")
+                if sukses: st.info(f"Respons Google: {msg}")
                 else: st.error(msg)
     with colC:
         if st.button("Manual: Kirim Global Whales"):
             df_ex = db.execute(f"SELECT * FROM trades WHERE value >= {whale_limit} ORDER BY timestamp DESC LIMIT 50").df()
             sukses, msg = kirim_ke_gsheets("Global_Whales", df_ex)
-            if sukses: st.success("Terkirim!")
+            if sukses: st.info(f"Respons Google: {msg}")
             else: st.error(msg)
 
     st.markdown("---")
@@ -237,9 +238,6 @@ with t4:
         df_logs = db.execute("SELECT * FROM sys_logs ORDER BY waktu DESC LIMIT 15").df()
         st.dataframe(df_logs, use_container_width=True)
 
-# ==========================================
-# TRIGGER REFRESH & SCROLL CONTROL
-# ==========================================
 if not pause_scroll:
     time.sleep(3)
     st.rerun()
