@@ -45,8 +45,10 @@ db = init_db()
 def start_wss_thread():
     def on_message(ws, message):
         try:
+            # CETAK KE TERMINAL STREAMLIT UNTUK DILIHAT
+            print(f"DATA MASUK: {message}") 
+            
             data = json.loads(message)
-            # Adaptasi sesuai struktur JSON Arjum API Bapak
             if 'data' in data:
                 trade = data['data']
                 ts = datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S')
@@ -54,23 +56,31 @@ def start_wss_thread():
                 price = float(trade.get('price', 0))
                 vol = int(trade.get('volume', 0))
                 val = float(trade.get('value', 0))
-                type_action = trade.get('type', 'UNKNOWN') # Buy/Sell
+                type_action = trade.get('type', 'UNKNOWN')
                 
-                # Insert langsung ke DuckDB
                 db.execute("INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?)", 
                            (ts, ticker, price, vol, val, type_action))
         except Exception as e:
-            pass
+            print(f"ERROR PARSING: {e} | ISI PESAN: {message}")
 
     def on_error(ws, error):
-        pass
+        print(f"KONEKSI ERROR: {error}")
+
+    def on_open(ws):
+        print("KONEKSI SUKSES TERBUKA! MENUNGGU DATA...")
+        # Jika Arjum butuh pesan subscribe, kirim di sini:
+        # ws.send(json.dumps({"action": "subscribe"})) 
 
     def run_ws():
-        ws_url = "wss://stock.arjum.com/ws/running-trade" # Ganti dengan URL WSS Arjum Bapak
-        ws = websocket.WebSocketApp(ws_url, on_message=on_message, on_error=on_error)
+        ws_url = "wss://stock.arjum.com/ws/running-trade" 
+        ws = websocket.WebSocketApp(ws_url, 
+                                    on_open=on_open,
+                                    on_message=on_message, 
+                                    on_error=on_error)
         while True:
             ws.run_forever()
-            time.sleep(3) # Auto-reconnect jika putus
+            print("KONEKSI TERPUTUS, MENCOBA SAMBUNG ULANG...")
+            time.sleep(3)
 
     t = threading.Thread(target=run_ws, daemon=True)
     t.start()
