@@ -136,10 +136,6 @@ whale_limit = st.sidebar.number_input("Batas Paus (Rp)", value=50000000, step=10
 top_interval = st.sidebar.selectbox("Interval Top 5", ["5 Menit", "15 Menit", "30 Menit", "1 Jam"])
 auto_refresh = st.sidebar.checkbox("Auto Refresh 2s", value=True)
 
-if auto_refresh:
-    time.sleep(2)
-    st.rerun()
-
 tab1, tab2, tab3, tab4 = st.tabs(["The Cockpit", "Screener", "Raw Market", "Automation"])
 
 # TAB 1: THE COCKPIT
@@ -209,3 +205,10 @@ with tab4:
         sukses, msg = backup_ke_gdrive()
         if sukses: st.success(msg)
         else: st.error(f"Gagal: {msg}")
+
+# ==========================================
+# TRIGGER AUTO REFRESH (RATA KIRI / TANPA SPASI)
+# ==========================================
+if auto_refresh:
+    time.sleep(2)
+    st.rerun()
