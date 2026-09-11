@@ -30,7 +30,7 @@ db = init_db()
 
 @st.cache_resource
 def get_sys_config():
-    # Menambahkan master_watchlist untuk Kabel Server
+    # Master_watchlist untuk Kabel Server
     return {"auto_export": False, "interval": 30, "last_export": int(time.time()), "master_watchlist": ["BBCA", "BMRI"]}
 
 sys_cfg = get_sys_config()
@@ -76,15 +76,32 @@ def start_engines():
             time.sleep(3)
 
     def run_cron():
+        # ⏰ SETELAN JAM DIVERGENT FEEDER
+        jadwal_feeder = [(18, 20)]
+        
         while True:
             time.sleep(1)
             now_wib = datetime.now(WIB)
             
+            # Auto Purge Database Jam 16:30
             if now_wib.hour == 16 and now_wib.minute == 30 and now_wib.second == 0:
                 catat_log("AUTO-PURGE 16:30: Mengosongkan RAM DB...")
                 db.execute("DELETE FROM trades")
                 time.sleep(2) 
                 
+            # Trigger Divergent Feeder via Webhook GAS
+            for jam, menit in jadwal_feeder:
+                if now_wib.hour == jam and now_wib.minute == menit and now_wib.second == 0:
+                    catat_log(f"Alarm {jam}:{menit} - Menembak Trigger Divergent ke GSheets...")
+                    try:
+                        wh_url = st.secrets.get("WEBHOOK_URL", "")
+                        if wh_url:
+                            res = requests.post(wh_url, json={"kategori": "TRIGGER_DIVERGENT"})
+                            catat_log(f"Respons Divergent: {res.text}")
+                    except Exception as e:
+                        catat_log(f"Error Divergent: {str(e)}")
+                        
+            # Auto-Export WSS Data ke GSheets
             if sys_cfg["auto_export"]:
                 curr_time = int(time.time())
                 if curr_time - sys_cfg["last_export"] >= sys_cfg["interval"]:
@@ -104,7 +121,7 @@ def start_engines():
                                 r1 = requests.post(wh_url, json={"kategori": "Top_Summary", "data": df_top.values.tolist()})
                                 catat_log(f"Auto Radar Flow: {r1.text}")
                                 
-                            # 2. Tembak Global Whales (Fixed minimal 50jt untuk Auto-Export)
+                            # 2. Tembak Global Whales (Fixed minimal 50jt)
                             df_whale = db.execute("SELECT * FROM trades WHERE value >= 50000000 ORDER BY timestamp DESC LIMIT 30").df()
                             if not df_whale.empty:
                                 df_whale['timestamp'] = df_whale['timestamp'].astype(str)
@@ -183,7 +200,6 @@ radar_time = st.sidebar.selectbox("Timeframe Radar (Menit)", [5, 15, 30, 60, 120
 st.sidebar.markdown("---")
 st.sidebar.subheader("📡 Kabel Server (Auto-Export)")
 
-# KOTAK MASTER: Khusus menyambung ke GSheets Bapak
 master_wl_input = st.sidebar.text_input("Target Emiten ke GSheets:", ", ".join(sys_cfg["master_watchlist"]))
 sys_cfg["master_watchlist"] = [x.strip().upper() for x in master_wl_input.split(",") if x.strip()]
 
@@ -197,12 +213,9 @@ with t1:
     
     with c1:
         st.subheader(f"Radar Net Flow ({radar_time} Menit)")
-        
-        # Ini tombol filter yang kembali!
         f_radar = st.radio("Aksi Radar:", ["All", "BUY", "SELL"], horizontal=True, key="rradar")
         
         if f_radar == "All":
-            # Jika All: Hitung Net Flow (Buy dikurangi Sell)
             q_netflow = f"""
                 SELECT ticker, 
                        SUM(CASE WHEN type = 'BUY' THEN value WHEN type = 'SELL' THEN -value ELSE 0 END) as Net_Value 
@@ -210,7 +223,6 @@ with t1:
                 GROUP BY ticker ORDER BY Net_Value DESC LIMIT 15
             """
         else:
-            # Jika BUY atau SELL: Hitung total omset murni sesuai filternya
             q_netflow = f"""
                 SELECT ticker, SUM(value) as Net_Value 
                 FROM trades WHERE timestamp >= NOW() - INTERVAL {radar_time} MINUTE AND type = '{f_radar}'
@@ -226,17 +238,9 @@ with t1:
         q_wh_type = f"AND type = '{f_wh}'" if f_wh != "All" else ""
         df_whale = db.execute(f"SELECT * FROM trades WHERE value >= {whale_limit} {q_wh_type} ORDER BY timestamp DESC LIMIT 200").df()
         st.dataframe(df_whale, column_config=cfg_std, hide_index=True, height=500, use_container_width=True)
-        
-    with c2:
-        st.subheader(f"Whale Trades (>= {pilihan_paus})")
-        f_wh = st.radio("Aksi Paus:", ["All", "BUY", "SELL"], horizontal=True, key="rwh")
-        q_wh_type = f"AND type = '{f_wh}'" if f_wh != "All" else ""
-        df_whale = db.execute(f"SELECT * FROM trades WHERE value >= {whale_limit} {q_wh_type} ORDER BY timestamp DESC LIMIT 200").df()
-        st.dataframe(df_whale, column_config=cfg_std, hide_index=True, height=500, use_container_width=True)
 
 with t2:
     st.subheader("Watchlist Orderbook (Layar Pribadi)")
-    # KOTAK LAYAR PRIBADI: Bebas diketik siapa saja, tidak merusak Kabel Server
     input_ui_wl = st.text_input("Ketik Emiten (Pisahkan koma):", "BREN, AMMN", key="ui_wl_input")
     f_wl = st.radio("Aksi Emiten:", ["All", "BUY", "SELL"], horizontal=True, key="rwl")
     
