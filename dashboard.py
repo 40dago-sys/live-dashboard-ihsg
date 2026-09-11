@@ -194,18 +194,38 @@ t1, t2, t3, t4 = st.tabs(["The Cockpit", "Screener", "Raw Market", "System & Exp
 
 with t1:
     c1, c2 = st.columns([1, 2])
+    
     with c1:
         st.subheader(f"Radar Net Flow ({radar_time} Menit)")
-        q_time = f"WHERE timestamp >= NOW() - INTERVAL {radar_time} MINUTE"
-        q_netflow = f"""
-            SELECT ticker, 
-                   SUM(CASE WHEN type = 'BUY' THEN value WHEN type = 'SELL' THEN -value ELSE 0 END) as Net_Value 
-            FROM trades {q_time} 
-            GROUP BY ticker 
-            ORDER BY Net_Value DESC LIMIT 15
-        """
+        
+        # Ini tombol filter yang kembali!
+        f_radar = st.radio("Aksi Radar:", ["All", "BUY", "SELL"], horizontal=True, key="rradar")
+        
+        if f_radar == "All":
+            # Jika All: Hitung Net Flow (Buy dikurangi Sell)
+            q_netflow = f"""
+                SELECT ticker, 
+                       SUM(CASE WHEN type = 'BUY' THEN value WHEN type = 'SELL' THEN -value ELSE 0 END) as Net_Value 
+                FROM trades WHERE timestamp >= NOW() - INTERVAL {radar_time} MINUTE
+                GROUP BY ticker ORDER BY Net_Value DESC LIMIT 15
+            """
+        else:
+            # Jika BUY atau SELL: Hitung total omset murni sesuai filternya
+            q_netflow = f"""
+                SELECT ticker, SUM(value) as Net_Value 
+                FROM trades WHERE timestamp >= NOW() - INTERVAL {radar_time} MINUTE AND type = '{f_radar}'
+                GROUP BY ticker ORDER BY Net_Value DESC LIMIT 15
+            """
+            
         df_top = db.execute(q_netflow).df()
         st.dataframe(df_top, column_config=cfg_top, hide_index=True, height=500, use_container_width=True)
+        
+    with c2:
+        st.subheader(f"Whale Trades (>= {pilihan_paus})")
+        f_wh = st.radio("Aksi Paus:", ["All", "BUY", "SELL"], horizontal=True, key="rwh")
+        q_wh_type = f"AND type = '{f_wh}'" if f_wh != "All" else ""
+        df_whale = db.execute(f"SELECT * FROM trades WHERE value >= {whale_limit} {q_wh_type} ORDER BY timestamp DESC LIMIT 200").df()
+        st.dataframe(df_whale, column_config=cfg_std, hide_index=True, height=500, use_container_width=True)
         
     with c2:
         st.subheader(f"Whale Trades (>= {pilihan_paus})")
