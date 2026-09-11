@@ -197,6 +197,12 @@ whale_limit = opsi_paus[pilihan_paus]
 
 radar_time = st.sidebar.selectbox("Timeframe Radar (Menit)", [5, 15, 30, 60, 120, 240], index=0)
 
+# TAMBAHAN BARU: Slider Performa Limit Baris
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ UI Performance Tuning")
+limit_wl = st.sidebar.slider("Limit Baris Watchlist", min_value=100, max_value=2000, value=500, step=100)
+limit_tape = st.sidebar.slider("Limit Baris Full Tape", min_value=1000, max_value=15000, value=5000, step=1000)
+
 st.sidebar.markdown("---")
 st.sidebar.subheader("📡 Kabel Server (Auto-Export)")
 
@@ -251,14 +257,16 @@ with t2:
             with cols[i % 3]:
                 st.markdown(f"**{saham}**")
                 q_wl_type = f"AND type = '{f_wl}'" if f_wl != "All" else ""
-                df_saham = db.execute(f"SELECT timestamp, price, lot, value, type FROM trades WHERE ticker = '{saham}' {q_wl_type} ORDER BY timestamp DESC LIMIT 100").df()
+                # LIMIT dihubungkan ke slider limit_wl
+                df_saham = db.execute(f"SELECT timestamp, price, lot, value, type FROM trades WHERE ticker = '{saham}' {q_wl_type} ORDER BY timestamp DESC LIMIT {limit_wl}").df()
                 st.dataframe(df_saham, column_config=cfg_std, hide_index=True, height=400, use_container_width=True)
 
 with t3:
     st.subheader("Historical Tape (Full Market)")
     f_raw = st.radio("Aksi Tape:", ["All", "BUY", "SELL"], horizontal=True, key="rraw")
     q_raw = f"WHERE type = '{f_raw}'" if f_raw != "All" else ""
-    df_raw = db.execute(f"SELECT * FROM trades {q_raw} ORDER BY timestamp DESC LIMIT 2000").df()
+    # LIMIT dihubungkan ke slider limit_tape
+    df_raw = db.execute(f"SELECT * FROM trades {q_raw} ORDER BY timestamp DESC LIMIT {limit_tape}").df()
     st.dataframe(df_raw, column_config=cfg_std, hide_index=True, height=600, use_container_width=True)
 
 with t4:
