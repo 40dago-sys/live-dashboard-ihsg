@@ -17,7 +17,6 @@ WIB = pytz.timezone('Asia/Jakarta')
 @st.cache_resource
 def init_db():
     con = duckdb.connect(database=':memory:', read_only=False)
-    # Kolom sekarang menggunakan LOT
     con.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             timestamp TIMESTAMP, ticker VARCHAR, price DOUBLE, 
@@ -31,7 +30,8 @@ db = init_db()
 
 @st.cache_resource
 def get_sys_config():
-    return {"auto_export": False, "interval": 30, "last_export": int(time.time())}
+    # Menambahkan master_watchlist untuk Kabel Server
+    return {"auto_export": False, "interval": 30, "last_export": int(time.time()), "master_watchlist": ["BBCA", "BMRI"]}
 
 sys_cfg = get_sys_config()
 
@@ -53,12 +53,9 @@ def start_engines():
                 ts = datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S')
                 ticker = trade.get('t', '')
                 price = float(trade.get('p', 0))
-                lot = int(trade.get('l', 0)) # Disimpan sebagai Lot
-                
-                # Value dihitung otomatis secara rahasia (Lot * 100 * Harga)
+                lot = int(trade.get('l', 0))
                 val = price * lot * 100
                 type_action = str(trade.get('c', '')).upper()
-                
                 db.execute("INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?)", (ts, ticker, price, lot, val, type_action))
         except Exception as e:
             pass 
@@ -94,18 +91,38 @@ def start_engines():
                     try:
                         wh_url = st.secrets.get("WEBHOOK_URL", "")
                         if wh_url:
-                            df_top = db.execute("SELECT ticker, SUM(value) as Net_Value FROM trades GROUP BY ticker ORDER BY Net_Value DESC LIMIT 10").df()
+                            # 1. Tembak Radar Flow (Logika Net Accumulation)
+                            q_top = """
+                                SELECT ticker, 
+                                       SUM(CASE WHEN type = 'BUY' THEN value WHEN type = 'SELL' THEN -value ELSE 0 END) as Net_Value 
+                                FROM trades GROUP BY ticker ORDER BY Net_Value DESC LIMIT 10
+                            """
+                            df_top = db.execute(q_top).df()
                             if not df_top.empty:
                                 df_top.insert(0, 'waktu', datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S'))
                                 df_top['waktu'] = df_top['waktu'].astype(str)
-                                requests.post(wh_url, json={"kategori": "Top_Summary", "data": df_top.values.tolist()})
+                                r1 = requests.post(wh_url, json={"kategori": "Top_Summary", "data": df_top.values.tolist()})
+                                catat_log(f"Auto Radar Flow: {r1.text}")
                                 
+                            # 2. Tembak Global Whales (Fixed minimal 50jt untuk Auto-Export)
                             df_whale = db.execute("SELECT * FROM trades WHERE value >= 50000000 ORDER BY timestamp DESC LIMIT 30").df()
                             if not df_whale.empty:
                                 df_whale['timestamp'] = df_whale['timestamp'].astype(str)
-                                requests.post(wh_url, json={"kategori": "Global_Whales", "data": df_whale.values.tolist()})
-                    except:
-                        pass
+                                r2 = requests.post(wh_url, json={"kategori": "Global_Whales", "data": df_whale.values.tolist()})
+                                catat_log(f"Auto Global Whales: {r2.text}")
+
+                            # 3. Tembak Watchlist (Membaca Kabel Server)
+                            wl = sys_cfg.get("master_watchlist", [])
+                            if wl:
+                                tup_saham = tuple(wl) if len(wl) > 1 else f"('{wl[0]}')"
+                                df_wl = db.execute(f"SELECT * FROM trades WHERE ticker IN {tup_saham} ORDER BY timestamp DESC LIMIT 50").df()
+                                if not df_wl.empty:
+                                    df_wl['timestamp'] = df_wl['timestamp'].astype(str)
+                                    r3 = requests.post(wh_url, json={"kategori": "Watchlist_Alerts", "data": df_wl.values.tolist()})
+                                    catat_log(f"Auto Watchlist: {r3.text}")
+                    except Exception as e:
+                        catat_log(f"Auto-Export Error: {str(e)}")
+                        
                     sys_cfg["last_export"] = curr_time
 
     threading.Thread(target=run_ws, daemon=True).start()
@@ -126,7 +143,6 @@ def kirim_ke_gsheets(kategori, df):
         if 'waktu' in df.columns: df['waktu'] = df['waktu'].astype(str)
         
         res = requests.post(webhook_url, json={"kategori": kategori, "data": df.values.tolist()})
-        # Kita ambil respons ASLI dari Google agar ketahuan errornya
         return (True, res.text) if res.status_code == 200 else (False, f"HTTP {res.status_code}")
     except Exception as e:
         return False, str(e)
@@ -140,25 +156,37 @@ cfg_std = {
     "timestamp": st.column_config.DatetimeColumn("Waktu", format="HH:mm:ss"),
     "ticker": st.column_config.TextColumn("Emiten"),
     "price": st.column_config.NumberColumn("Harga", format="%d"),
-    "lot": st.column_config.NumberColumn("Volume (Lot)", format="%,d"), # Sudah diubah ke LOT
+    "lot": st.column_config.NumberColumn("Volume (Lot)", format="%,d"),
     "value": st.column_config.NumberColumn("Nilai (Rp)", format="%,d"),
     "type": st.column_config.TextColumn("Action")
 }
 cfg_top = {
     "ticker": st.column_config.TextColumn("Emiten"),
-    "Net_Value": st.column_config.NumberColumn("Total Akumulasi (Rp)", format="%,d")
+    "Net_Value": st.column_config.NumberColumn("Net Akumulasi (Rp)", format="%,d")
 }
 
 # --- SIDEBAR KONTROL ---
 st.sidebar.header("🕹️ Control Panel")
-pause_scroll = st.sidebar.checkbox("⏸️ Pause Live View (Untuk Scrolling)", value=False)
-whale_limit = st.sidebar.number_input("Batas Paus (Rp)", value=50000000, step=10000000)
+pause_scroll = st.sidebar.checkbox("⏸️ Pause Live View (Scrolling)", value=False)
 
-# Mengembalikan Slider Timeframe
+opsi_paus = {
+    "Rp 50,000,000": 50000000, "Rp 75,000,000": 75000000, 
+    "Rp 100,000,000": 100000000, "Rp 200,000,000": 200000000, 
+    "Rp 300,000,000": 300000000, "Rp 400,000,000": 400000000, 
+    "Rp 500,000,000": 500000000, "Rp 1,000,000,000": 1000000000
+}
+pilihan_paus = st.sidebar.selectbox("Batas Paus (Layar)", list(opsi_paus.keys()), index=0)
+whale_limit = opsi_paus[pilihan_paus] 
+
 radar_time = st.sidebar.selectbox("Timeframe Radar (Menit)", [5, 15, 30, 60, 120, 240], index=0)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("⚙️ Auto-Export GSheets")
+st.sidebar.subheader("📡 Kabel Server (Auto-Export)")
+
+# KOTAK MASTER: Khusus menyambung ke GSheets Bapak
+master_wl_input = st.sidebar.text_input("Target Emiten ke GSheets:", ", ".join(sys_cfg["master_watchlist"]))
+sys_cfg["master_watchlist"] = [x.strip().upper() for x in master_wl_input.split(",") if x.strip()]
+
 sys_cfg["auto_export"] = st.sidebar.toggle("Aktifkan Auto-Export", value=False)
 sys_cfg["interval"] = st.sidebar.slider("Interval (Detik)", min_value=10, max_value=180, value=30, step=10)
 
@@ -167,33 +195,35 @@ t1, t2, t3, t4 = st.tabs(["The Cockpit", "Screener", "Raw Market", "System & Exp
 with t1:
     c1, c2 = st.columns([1, 2])
     with c1:
-        st.subheader(f"Radar Velocity ({radar_time} Menit Terakhir)")
-        f_top = st.radio("Aksi:", ["All", "BUY", "SELL"], horizontal=True, key="rtop")
-        
-        # Logika SQL dengan Filter Timeframe
-        q_type = f"type = '{f_top}' AND" if f_top != "All" else ""
-        q_time = f"timestamp >= NOW() - INTERVAL {radar_time} MINUTE"
-        
-        df_top = db.execute(f"SELECT ticker, SUM(value) as Net_Value FROM trades WHERE {q_type} {q_time} GROUP BY ticker ORDER BY Net_Value DESC LIMIT 15").df()
+        st.subheader(f"Radar Net Flow ({radar_time} Menit)")
+        q_time = f"WHERE timestamp >= NOW() - INTERVAL {radar_time} MINUTE"
+        q_netflow = f"""
+            SELECT ticker, 
+                   SUM(CASE WHEN type = 'BUY' THEN value WHEN type = 'SELL' THEN -value ELSE 0 END) as Net_Value 
+            FROM trades {q_time} 
+            GROUP BY ticker 
+            ORDER BY Net_Value DESC LIMIT 15
+        """
+        df_top = db.execute(q_netflow).df()
         st.dataframe(df_top, column_config=cfg_top, hide_index=True, height=500, use_container_width=True)
         
     with c2:
-        st.subheader(f"Whale Trades (> Rp {whale_limit:,.0f})")
+        st.subheader(f"Whale Trades (>= {pilihan_paus})")
         f_wh = st.radio("Aksi Paus:", ["All", "BUY", "SELL"], horizontal=True, key="rwh")
         q_wh_type = f"AND type = '{f_wh}'" if f_wh != "All" else ""
         df_whale = db.execute(f"SELECT * FROM trades WHERE value >= {whale_limit} {q_wh_type} ORDER BY timestamp DESC LIMIT 200").df()
         st.dataframe(df_whale, column_config=cfg_std, hide_index=True, height=500, use_container_width=True)
 
 with t2:
-    st.subheader("Watchlist Orderbook")
-    input_em = st.text_input("Ketik Emiten (Pisahkan koma):", "BBCA, BREN, BMRI, AMMN")
+    st.subheader("Watchlist Orderbook (Layar Pribadi)")
+    # KOTAK LAYAR PRIBADI: Bebas diketik siapa saja, tidak merusak Kabel Server
+    input_ui_wl = st.text_input("Ketik Emiten (Pisahkan koma):", "BREN, AMMN", key="ui_wl_input")
     f_wl = st.radio("Aksi Emiten:", ["All", "BUY", "SELL"], horizontal=True, key="rwl")
     
-    list_emiten = [x.strip().upper() for x in input_em.split(",") if x.strip()]
-    if list_emiten:
-        # Kunci maksimal 3 kolom sejajar
-        cols = st.columns(min(len(list_emiten), 3))
-        for i, saham in enumerate(list_emiten):
+    list_ui_emiten = [x.strip().upper() for x in input_ui_wl.split(",") if x.strip()]
+    if list_ui_emiten:
+        cols = st.columns(min(len(list_ui_emiten), 3))
+        for i, saham in enumerate(list_ui_emiten):
             with cols[i % 3]:
                 st.markdown(f"**{saham}**")
                 q_wl_type = f"AND type = '{f_wl}'" if f_wl != "All" else ""
@@ -211,20 +241,26 @@ with t4:
     st.subheader("Manual Exporter & Log")
     colA, colB, colC = st.columns(3)
     with colA:
-        if st.button("Manual: Kirim Top Summary"):
-            df_ex = db.execute(f"SELECT ticker, SUM(value) as Net_Value FROM trades WHERE timestamp >= NOW() - INTERVAL {radar_time} MINUTE GROUP BY ticker ORDER BY Net_Value DESC LIMIT 10").df()
+        if st.button("Manual: Kirim Radar Flow"):
+            q_ex_netflow = f"""
+                SELECT ticker, SUM(CASE WHEN type = 'BUY' THEN value WHEN type = 'SELL' THEN -value ELSE 0 END) as Net_Value 
+                FROM trades WHERE timestamp >= NOW() - INTERVAL {radar_time} MINUTE GROUP BY ticker ORDER BY Net_Value DESC LIMIT 10
+            """
+            df_ex = db.execute(q_ex_netflow).df()
             df_ex.insert(0, 'waktu', datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S'))
             sukses, msg = kirim_ke_gsheets("Top_Summary", df_ex)
             if sukses: st.info(f"Respons Google: {msg}")
             else: st.error(msg)
     with colB:
-        if st.button("Manual: Kirim Watchlist"):
-            if list_emiten:
-                tup_saham = tuple(list_emiten) if len(list_emiten) > 1 else f"('{list_emiten[0]}')"
+        if st.button("Manual: Kirim Target GSheets"):
+            wl_master = sys_cfg.get("master_watchlist", [])
+            if wl_master:
+                tup_saham = tuple(wl_master) if len(wl_master) > 1 else f"('{wl_master[0]}')"
                 df_ex = db.execute(f"SELECT * FROM trades WHERE ticker IN {tup_saham} ORDER BY timestamp DESC LIMIT 50").df()
                 sukses, msg = kirim_ke_gsheets("Watchlist_Alerts", df_ex)
                 if sukses: st.info(f"Respons Google: {msg}")
                 else: st.error(msg)
+            else: st.warning("Kabel Server (Target Emiten) kosong.")
     with colC:
         if st.button("Manual: Kirim Global Whales"):
             df_ex = db.execute(f"SELECT * FROM trades WHERE value >= {whale_limit} ORDER BY timestamp DESC LIMIT 50").df()
@@ -233,31 +269,24 @@ with t4:
             else: st.error(msg)
 
     st.markdown("---")
-    with st.expander("📡 Status Koneksi WSS (Klik untuk buka log)"):
+    with st.expander("📡 Status Koneksi WSS & Log Mesin"):
         df_logs = db.execute("SELECT * FROM sys_logs ORDER BY waktu DESC LIMIT 15").df()
         st.dataframe(df_logs, use_container_width=True)
 
-    # ==========================================
-    # TOMBOL SUNTIKAN DUMMY (UAT) ADA DI SINI
-    # ==========================================
     st.markdown("---")
     st.subheader("🧪 UAT Mode (Market Closed Simulator)")
-    if st.button("Suntik 100 Data Dummy (Untuk Test Export)"):
+    if st.button("Suntik 100 Data Dummy"):
         import random
         ts = datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S')
         saham_list = ["BBCA", "BREN", "BMRI", "AMMN", "ASII", "CUAN", "TPIA"]
-        
         for _ in range(100):
             ticker = random.choice(saham_list)
             price = random.randint(1000, 9000)
             lot = random.randint(10, 15000) 
             val = price * lot * 100
             tipe = random.choice(["BUY", "SELL"])
-            
-            db.execute("INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?)", 
-                       (ts, ticker, price, lot, val, tipe))
-            
-        st.success("✅ 100 Baris Data Dummy berhasil disuntikkan! Silakan cek Tab 1-3 dan klik tombol Export.")
+            db.execute("INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?)", (ts, ticker, price, lot, val, tipe))
+        st.success("✅ 100 Baris Data Dummy berhasil disuntikkan!")
 
 if not pause_scroll:
     time.sleep(3)
